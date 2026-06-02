@@ -1,49 +1,36 @@
+// src/main.rs
 use egui_window_glfw_passthrough::{GlfwBackend, GlfwConfig};
 use std::sync::Arc;
-
-// Importações necessárias para o atalho global
 use global_hotkey::{hotkey::{HotKey, Modifiers, Code}, GlobalHotKeyManager, GlobalHotKeyEvent};
+
+use windows_sys::Win32::UI::Magnification::{MagInitialize, MagUninitialize};
+
+mod filtros;
+mod audio; // IMPORTA O NOVO MÓDULO DE ÁUDIO
 
 #[allow(deprecated)] 
 fn main() {
     tracing_subscriber::fmt::init();
+    unsafe { MagInitialize(); }
 
-    // --- CORREÇÃO A NÍVEL DE GLFW ---
-    // Precisamos inicializar o GLFW temporariamente para dar o "Hint" (pista) de ToolWindow nativa
     let mut glfw_instance = glfw::init(glfw::fail_on_errors).unwrap();
-    // Dizemos ao GLFW que a próxima janela criada deve ser uma Floating Tool Window (ignora Win+D)
     glfw_instance.window_hint(glfw::WindowHint::Floating(true));
-    // Esta linha diz ao Windows para não colocar a janela na barra de tarefas e ignorar o minimizar:
-    glfw_instance.window_hint(glfw::WindowHint::CocoaRetinaFramebuffer(false)); // (Apenas garante compatibilidade)
-    // ---------------------------------
+    glfw_instance.window_hint(glfw::WindowHint::CocoaRetinaFramebuffer(false));
 
-    // 2. Configura a janela do Overlay
     let mut config = GlfwConfig::default();
-    config.window_title = "Meu Primeiro Overlay".to_string();
+    config.window_title = "Overlay Hardware Pro".to_string();
     config.size = [1920, 1080]; 
     config.transparent_window = Some(true);
     config.opengl_window = Some(true);
 
-    // 3. Cria o Backend (Ele vai herdar as configurações que o GLFW preparou acima)
     let mut backend = GlfwBackend::new(config);
-    
     backend.window.set_decorated(false);
     backend.window.set_floating(true);
+    backend.window.set_focus_on_show(false);
 
-    // Se o seu compilador reclamar que o GlfwBackend já tenta inicializar o GLFW internamente,
-    // a forma alternativa e direta de fazer isso na janela já criada é puxando os atributos nativos:
-    backend.window.set_focus_on_show(false); // Evita roubar o foco do Windows ao abrir
-
-    // --- CONFIGURAÇÃO DO ATALHO GLOBAL ---
-    // Inicializa o gerenciador global do sistema operacional
     let hotkey_manager = GlobalHotKeyManager::new().unwrap();
-    
-    // Define o atalho: Vamos usar SHIFT + F11 para evitar conflitos com jogos
     let hotkey = HotKey::new(Some(Modifiers::SHIFT), Code::F11);
-    
-    // Registra o atalho no Windows
     hotkey_manager.register(hotkey).expect("Falha ao registrar atalho global");
-    // --------------------------------------
 
     let gl = unsafe {
         glow::Context::from_loader_function(|s| backend.get_proc_address(s) as *const _)
@@ -54,27 +41,29 @@ fn main() {
     let mut egui_glow = egui_glow::Painter::new(gl.clone(), "", None, false)
         .expect("Falha ao inicializar o pintor oficial do Egui");
 
-    // Começamos com o menu aberto
     let mut modo_menu_interativo = true; 
+    
+    // INICIALIZA O SISTEMA DE ÁUDIO REATIVO
+    let gerenciador_audio = audio::GerenciadorAudio::new();
+    let mut limitador_ligado = false;
+    let mut limite_volume = 0.5; // Corresponde a 50% da barra de pico máximo
+
+    // ESTADOS DA INTERFACE VISUAL
+    let mut filtro_atual = filtros::ModoDaltonismo::Desativado;
+    let mut intensidade = 1.0;  
+    let mut brilho = 0.0;       
+    let mut contraste = 1.0;    
+    let mut saturacao = 1.0;    
 
     while !backend.window.should_close() {
         backend.tick();
         let raw_input = backend.take_raw_input();
         
-        // --- VERIFICAÇÃO DO ATALHO GLOBAL ---
-        // O Windows vai disparar um evento aqui SEMPRE que o atalho for pressionado,
-        // mesmo se você estiver jogando em tela cheia.
         if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            // Se o ID do evento for igual ao do nosso atalho...
-            if event.id == hotkey.id() {
-                // Transformamos o enum interno em texto e checamos se ele é "Pressed"
-                if format!("{:?}", event.state) == "Pressed" {
-                    modo_menu_interativo = !modo_menu_interativo;
-                    println!("Atalho detectado globalmente! Menu interativo: {}", modo_menu_interativo);
-                }
+            if event.id == hotkey.id() && format!("{:?}", event.state) == "Pressed" {
+                modo_menu_interativo = !modo_menu_interativo;
             }
         }
-        // -------------------------------------
 
         unsafe {
             use glow::HasContext;
@@ -85,14 +74,80 @@ fn main() {
         egui_ctx.begin_frame(raw_input);
 
         if modo_menu_interativo {
-            egui::Window::new("Configurações do Overlay")
+            egui::Window::new("Painel do Overlay Core")
                 .default_open(true)
                 .show(&egui_ctx, |ui| {
-                    ui.label("Seja bem-vindo ao seu protótipo!");
+                    ui.heading("Acessibilidade Visual");
                     ui.separator();
-                    ui.label("Aperte SHIFT + F11 globalmente (mesmo jogando) para sumir/aparecer.");
                     
-                    if ui.button("Sair do Overlay").clicked() {
+                    let mut mudou_video = false;
+
+                    egui::ComboBox::from_label("Modo Daltonismo")
+                        .selected_text(match filtro_atual {
+                            filtros::ModoDaltonismo::Desativado => "Nenhum (Normal)",
+                            filtros::ModoDaltonismo::Protanopia => "Protanopia (Vermelho)",
+                            filtros::ModoDaltonismo::Deuteranopia => "Deuteranopia (Verde)",
+                            filtros::ModoDaltonismo::Tritanopia => "Tritanopia (Azul)",
+                            filtros::ModoDaltonismo::Acromatopsia => "Acromatopsia (Preto e Branco)",
+                        })
+                        .show_ui(ui, |ui| {
+                            mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Desativado, "Nenhum (Normal)").changed();
+                            mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Protanopia, "Protanopia (Vermelho)").changed();
+                            mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Deuteranopia, "Deuteranopia (Verde)").changed();
+                            mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Tritanopia, "Tritanopia (Azul)").changed();
+                            mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Acromatopsia, "Acromatopsia (Preto e Branco)").changed();
+                        });
+
+                    if filtro_atual != filtros::ModoDaltonismo::Desativado {
+                        ui.add_space(4.0);
+                        mudou_video |= ui.add(egui::Slider::new(&mut intensidade, 0.0..=1.0)
+                            .text("Intensidade do Filtro")
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))).changed();
+                    }
+
+                    ui.add_space(6.0);
+                    mudou_video |= ui.add(egui::Slider::new(&mut brilho, -0.5..=0.5).text("Brilho")).changed();
+                    mudou_video |= ui.add(egui::Slider::new(&mut contraste, 0.3..=2.0).text("Contraste")).changed();
+                    mudou_video |= ui.add(egui::Slider::new(&mut saturacao, 0.0..=3.0).text("Saturação")).changed();
+
+                    if mudou_video {
+                        filtros::atualizar_filtros(filtro_atual, brilho, contraste, saturacao, intensidade);
+                    }
+
+                    // Nova seção criada especialmente para o controle de Áudio
+                    ui.add_space(10.0);
+                    ui.heading("Proteção Auditiva Intel");
+                    ui.separator();
+
+                    if ui.checkbox(&mut limitador_ligado, "Ativar Limitador de Áudio Reativo").changed() {
+                        gerenciador_audio.set_ativo(limitador_ligado);
+                    }
+
+                    if limitador_ligado {
+                        ui.small("Abaixa o som do PC automaticamente se passar do teto estipulado.");
+                        if ui.add(egui::Slider::new(&mut limite_volume, 0.05..=0.95)
+                            .text("Teto de Volume")
+                            .custom_formatter(|v, _| format!("{:.0}% do Pico", v * 100.0))).changed() 
+                        {
+                            gerenciador_audio.set_limite(limite_volume);
+                        }
+                    }
+
+                    ui.separator();
+                    if ui.button("Resetar Tudo").clicked() {
+                        filtro_atual = filtros::ModoDaltonismo::Desativado;
+                        intensidade = 1.0;
+                        brilho = 0.0;
+                        contraste = 1.0;
+                        saturacao = 1.0;
+                        filtros::atualizar_filtros(filtro_atual, brilho, contraste, saturacao, intensidade);
+
+                        limitador_ligado = false;
+                        gerenciador_audio.set_ativo(false);
+                    }
+                    
+                    ui.add_space(4.0);
+                    if ui.button("Fechar Software").clicked() {
                         backend.window.set_should_close(true);
                     }
                 });
@@ -125,5 +180,10 @@ fn main() {
         backend.glfw.poll_events();
     }
 
+    // Desliga tudo com segurança ao fechar
+    filtros::atualizar_filtros(filtros::ModoDaltonismo::Desativado, 0.0, 1.0, 1.0, 1.0);
+    gerenciador_audio.set_ativo(false);
+    unsafe { MagUninitialize(); }
+    
     egui_glow.destroy();
 }

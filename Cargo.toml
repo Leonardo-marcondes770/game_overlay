@@ -16,6 +16,9 @@ tracing-subscriber = "0.3"
 
 global-hotkey = "0.6"
 
+image = "0.25"
+xcap = "0.0.9"
+
 # Versão ultra-leve da API do Windows apenas para as funções de vídeo
 windows-sys = { version = "0.52.0", features = [
     "Win32_Foundation",          # Ativa o tipo BOOL usado pelas funções de vídeo

@@ -1,17 +1,40 @@
 use egui_window_glfw_passthrough::{GlfwBackend, GlfwConfig};
 use std::sync::Arc;
 use global_hotkey::{hotkey::{HotKey, Modifiers, Code}, GlobalHotKeyManager, GlobalHotKeyEvent, HotKeyState};
-use std::time::{Duration, Instant};
 
 use windows_sys::Win32::UI::Magnification::{MagInitialize, MagUninitialize};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
 
 mod filtros;
 mod audio;
 mod leitor;
 use leitor::GerenciadorLeitor;
 
+mod config;
+use config::AppConfig;
+
+fn configurar_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        println!("CRASH FATAL DETECTADO: {}", info);
+        let identidade = windows_sys::Win32::UI::Magnification::MAGCOLOREFFECT {
+            transform: [
+                1.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        };
+        unsafe {
+            windows_sys::Win32::UI::Magnification::MagSetFullscreenColorEffect(&identidade);
+            windows_sys::Win32::UI::Magnification::MagUninitialize();
+        }
+    }));
+}
+
 #[allow(deprecated)] 
 fn main() {
+    configurar_panic_hook();
     tracing_subscriber::fmt::init();
     unsafe { MagInitialize(); }
 
@@ -19,9 +42,15 @@ fn main() {
     glfw_instance.window_hint(glfw::WindowHint::Floating(true));
     glfw_instance.window_hint(glfw::WindowHint::CocoaRetinaFramebuffer(false));
 
+    // 👇 1. LÊ A TELA VIRTUAL (TODOS OS MONITORES COMBINADOS)
+    let v_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let v_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let v_w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let v_h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+
     let mut config = GlfwConfig::default();
-    config.window_title = "Overlay Hardware Pro".to_string();
-    config.size = [1920, 1080]; 
+    config.window_title = "GhostOverlay".to_string();
+    config.size = [v_w as u32, (v_h - 1) as u32]; 
     config.transparent_window = Some(true);
     config.opengl_window = Some(true);
 
@@ -29,6 +58,10 @@ fn main() {
     backend.window.set_decorated(false);
     backend.window.set_floating(true);
     backend.window.set_focus_on_show(false);
+
+    // 👇 2. POSICIONA E ESTICA O OVERLAY SOBRE TODAS AS TELAS
+    backend.window.set_pos(v_x, v_y);
+    backend.window.set_size(v_w, v_h - 1);
 
     let hotkey_manager = GlobalHotKeyManager::new().unwrap();
     let hotkey = HotKey::new(Some(Modifiers::SHIFT), Code::F11);
@@ -44,6 +77,7 @@ fn main() {
         .expect("Falha ao inicializar o pintor oficial do Egui");
 
     let mut modo_menu_interativo = true; 
+    let mut config_app = AppConfig::carregar();
     
     // INICIALIZA O SISTEMA DE ÁUDIO REATIVO (MOCK)
     let gerenciador_audio = audio::GerenciadorAudio::new();
@@ -51,28 +85,28 @@ fn main() {
     let mut limite_volume = 0.5;
 
     // INICIALIZA O GERENCIADOR DO LEITOR DE TELA (OCR)
-    let mut gerenciador_leitor = GerenciadorLeitor::new();
+    let mut gerenciador_leitor = GerenciadorLeitor::new(egui_ctx.clone());
+    gerenciador_leitor.ativo = config_app.leitor_ativo;
+    gerenciador_leitor.tts_volume = config_app.tts_volume;
+    gerenciador_leitor.tts_velocidade = config_app.tts_velocidade;
+    gerenciador_leitor.tts_pitch = config_app.tts_pitch;
+    gerenciador_leitor.leitura_periodica = config_app.leitura_periodica;
+    gerenciador_leitor.intervalo_leitura = config_app.intervalo_leitura;
+    gerenciador_leitor.leitura_mouse = config_app.leitura_mouse;
+    gerenciador_leitor.largura_area_mouse = config_app.largura_area_mouse;
+    gerenciador_leitor.altura_area_mouse = config_app.altura_area_mouse;
+    gerenciador_leitor.atualizar_config_tts();
 
-    // ESTADOS DA INTERFACE VISUAL
-    let mut filtro_atual = filtros::ModoDaltonismo::Desativado;
-    let mut intensidade = 1.0;  
-    let mut brilho = 0.0;       
-    let mut contraste = 1.0;    
-    let mut saturacao = 1.0;    
-
-    // Controle de frame rate para evitar uso de 100% da CPU
-    let mut ultimo_frame = Instant::now();
+    filtros::atualizar_filtros(config_app.filtro_atual, config_app.brilho, config_app.contraste, config_app.saturacao, config_app.intensidade);
 
     while !backend.window.should_close() {
         backend.tick();
         let raw_input = backend.take_raw_input();
         
-        // 🎯 OTIMIZAÇÃO 1: Passando o contexto correto para a thread do OCR não travar a UI
         gerenciador_leitor.atualizar_tick(&egui_ctx);
         
-        // Processa eventos de atalho global
+        // Processa eventos de atalho global (Shift + F11)
         if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            // 🎯 OTIMIZAÇÃO 2: Comparação direta via Enum em vez de alocar String com format!()
             if event.id == hotkey.id() && event.state == HotKeyState::Pressed {
                 modo_menu_interativo = !modo_menu_interativo;
                 if !modo_menu_interativo {
@@ -93,16 +127,16 @@ fn main() {
         if modo_menu_interativo || gerenciador_leitor.modo_selecao {
             
             if modo_menu_interativo {
-                egui::Window::new("Painel do Overlay Core")
+                egui::Window::new("Ghost Overlay")
                     .default_open(true)
                     .show(&egui_ctx, |ui| {
-                        ui.heading("Acessibilidade Visual");
+                        ui.heading("Overlay de Acessibilidade");
                         ui.separator();
                         
                         let mut mudou_video = false;
 
-                        egui::ComboBox::from_label("Modo Daltonismo")
-                            .selected_text(match filtro_atual {
+                        egui::ComboBox::from_label("Filtro para Daltonismo")
+                            .selected_text(match config_app.filtro_atual {
                                 filtros::ModoDaltonismo::Desativado => "Nenhum (Normal)",
                                 filtros::ModoDaltonismo::Protanopia => "Protanopia (Vermelho)",
                                 filtros::ModoDaltonismo::Deuteranopia => "Deuteranopia (Verde)",
@@ -110,27 +144,27 @@ fn main() {
                                 filtros::ModoDaltonismo::Acromatopsia => "Acromatopsia (Preto e Branco)",
                             })
                             .show_ui(ui, |ui| {
-                                mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Desativado, "Nenhum (Normal)").changed();
-                                mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Protanopia, "Protanopia (Vermelho)").changed();
-                                mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Deuteranopia, "Deuteranopia (Verde)").changed();
-                                mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Tritanopia, "Tritanopia (Azul)").changed();
-                                mudou_video |= ui.selectable_value(&mut filtro_atual, filtros::ModoDaltonismo::Acromatopsia, "Acromatopsia (Preto e Branco)").changed();
+                                mudou_video |= ui.selectable_value(&mut config_app.filtro_atual, filtros::ModoDaltonismo::Desativado, "Nenhum (Normal)").changed();
+                                mudou_video |= ui.selectable_value(&mut config_app.filtro_atual, filtros::ModoDaltonismo::Protanopia, "Protanopia (Vermelho)").changed();
+                                mudou_video |= ui.selectable_value(&mut config_app.filtro_atual, filtros::ModoDaltonismo::Deuteranopia, "Deuteranopia (Verde)").changed();
+                                mudou_video |= ui.selectable_value(&mut config_app.filtro_atual, filtros::ModoDaltonismo::Tritanopia, "Tritanopia (Azul)").changed();
+                                mudou_video |= ui.selectable_value(&mut config_app.filtro_atual, filtros::ModoDaltonismo::Acromatopsia, "Acromatopsia (Preto e Branco)").changed();
                             });
 
-                        if filtro_atual != filtros::ModoDaltonismo::Desativado {
+                        if config_app.filtro_atual != filtros::ModoDaltonismo::Desativado {
                             ui.add_space(4.0);
-                            mudou_video |= ui.add(egui::Slider::new(&mut intensidade, 0.0..=1.0)
+                            mudou_video |= ui.add(egui::Slider::new(&mut config_app.intensidade, 0.0..=1.0)
                                 .text("Intensidade do Filtro")
                                 .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))).changed();
                         }
 
                         ui.add_space(6.0);
-                        mudou_video |= ui.add(egui::Slider::new(&mut brilho, -0.5..=0.5).text("Brilho")).changed();
-                        mudou_video |= ui.add(egui::Slider::new(&mut contraste, 0.3..=2.0).text("Contraste")).changed();
-                        mudou_video |= ui.add(egui::Slider::new(&mut saturacao, 0.0..=3.0).text("Saturação")).changed();
+                        mudou_video |= ui.add(egui::Slider::new(&mut config_app.brilho, -0.5..=0.5).text("Brilho")).changed();
+                        mudou_video |= ui.add(egui::Slider::new(&mut config_app.contraste, 0.3..=2.0).text("Contraste")).changed();
+                        mudou_video |= ui.add(egui::Slider::new(&mut config_app.saturacao, 0.0..=3.0).text("Saturação")).changed();
 
                         if mudou_video {
-                            filtros::atualizar_filtros(filtro_atual, brilho, contraste, saturacao, intensidade);
+                            filtros::atualizar_filtros(config_app.filtro_atual, config_app.brilho, config_app.contraste, config_app.saturacao, config_app.intensidade);
                         }
 
                         // SEÇÃO DO ON-SCREEN READER (OCR)
@@ -139,35 +173,32 @@ fn main() {
                             modo_menu_interativo = false; 
                         }
 
-                        // SEÇÃO DE PROTEÇÃO AUDITIVA (MOCK)
+                        // SEÇÃO DE PROTEÇÃO AUDITIVA
                         ui.add_space(10.0);
-                        ui.heading("Proteção Auditiva Intel");
+                        ui.heading("Proteção Auditiva");
                         ui.separator();
 
-                        if ui.checkbox(&mut limitador_ligado, "Ativar Limitador de Áudio Reativo").changed() {
-                            gerenciador_audio.set_ativo(limitador_ligado);
+                        if ui.checkbox(&mut config_app.limitador_ligado, "Ativar Limitador de Áudio Reativo").changed() {
+                            gerenciador_audio.set_ativo(config_app.limitador_ligado);
                         }
 
-                        if limitador_ligado {
+                        if config_app.limitador_ligado {
                             ui.small("Abaixa o som do PC automaticamente se passar do teto estipulado.");
-                            if ui.add(egui::Slider::new(&mut limite_volume, 0.05..=0.95)
+                            if ui.add(egui::Slider::new(&mut config_app.limite_volume, 0.05..=0.95)
                                 .text("Teto de Volume")
                                 .custom_formatter(|v, _| format!("{:.0}% do Pico", v * 100.0))).changed() 
                             {
-                                gerenciador_audio.set_limite(limite_volume);
+                                gerenciador_audio.set_limite(config_app.limite_volume);
                             }
                         }
 
                         ui.separator();
                         if ui.button("Resetar Tudo").clicked() {
-                            filtro_atual = filtros::ModoDaltonismo::Desativado;
-                            intensidade = 1.0;
-                            brilho = 0.0;
-                            contraste = 1.0;
-                            saturacao = 1.0;
-                            filtros::atualizar_filtros(filtro_atual, brilho, contraste, saturacao, intensidade);
+                            // Volta a configuração inteira para o padrão
+                            config_app = AppConfig::default(); 
+                            
+                            filtros::atualizar_filtros(config_app.filtro_atual, config_app.brilho, config_app.contraste, config_app.saturacao, config_app.intensidade);
 
-                            limitador_ligado = false;
                             gerenciador_audio.set_ativo(false);
                             
                             gerenciador_leitor.ativo = false;
@@ -181,7 +212,7 @@ fn main() {
                         }
                     });
             } else {
-                // 🎯 REQUISITO: Se o menu está oculto mas a seleção de área está rodando...
+                // Se o menu está oculto mas a seleção de área está rodando...
                 gerenciador_leitor.executar_selecao_invisivel(&egui_ctx);
                 
                 // Assim que o usuário solta o clique do mouse, o `executar_selecao_invisivel` 
@@ -191,6 +222,9 @@ fn main() {
                 }
             }
         }
+
+        // Renderiza o debug sempre, independente de o menu estar aberto ou não
+        gerenciador_leitor.renderizar_overlay_debug(&egui_ctx);
 
         let full_output = egui_ctx.end_frame();
         
@@ -219,21 +253,29 @@ fn main() {
 
         use glfw::Context;
         backend.window.swap_buffers();
-        backend.glfw.poll_events();
-
-        // 🎯 OTIMIZAÇÃO 3: Limitador de FPS dinâmico para não roubar processamento dos jogos
-        let tempo_de_frame = ultimo_frame.elapsed();
-        // Alvo de ~144 FPS (aprox. 7ms por frame). Se o processamento foi mais rápido, dorme o resto do tempo.
-        if tempo_de_frame < Duration::from_millis(7) {
-            std::thread::sleep(Duration::from_millis(7) - tempo_de_frame);
-        }
-        ultimo_frame = Instant::now();
+        backend.glfw.wait_events_timeout(0.016);
     }
 
-    // Desliga tudo com segurança ao fechar
+    // --- FIM DO LAÇO WHILE ---
+
+    // 1. Atualizamos nossa struct com o estado final do leitor antes de salvar
+    config_app.leitor_ativo = gerenciador_leitor.ativo;
+    config_app.tts_volume = gerenciador_leitor.tts_volume;
+    config_app.tts_velocidade = gerenciador_leitor.tts_velocidade;
+    config_app.tts_pitch = gerenciador_leitor.tts_pitch;
+    config_app.leitura_periodica = gerenciador_leitor.leitura_periodica;
+    config_app.intervalo_leitura = gerenciador_leitor.intervalo_leitura;
+    config_app.leitura_mouse = gerenciador_leitor.leitura_mouse;
+    config_app.largura_area_mouse = gerenciador_leitor.largura_area_mouse;
+    config_app.altura_area_mouse = gerenciador_leitor.altura_area_mouse;
+    
+    // 2. Salva as configurações em %APPDATA%/GhostOverlay/config.json
+    config_app.salvar();
+
+    // 3. Desliga tudo com segurança ao fechar
     filtros::atualizar_filtros(filtros::ModoDaltonismo::Desativado, 0.0, 1.0, 1.0, 1.0);
     gerenciador_audio.set_ativo(false);
-    unsafe { MagUninitialize(); }
+    unsafe { windows_sys::Win32::UI::Magnification::MagUninitialize(); }
     
     egui_glow.destroy();
-}
+    }

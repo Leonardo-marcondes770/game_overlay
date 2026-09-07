@@ -1,7 +1,8 @@
 // src/filtros.rs
 use windows_sys::Win32::UI::Magnification::{MagSetFullscreenColorEffect, MAGCOLOREFFECT};
+use serde::{Serialize, Deserialize};
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub enum ModoDaltonismo {
     Desativado,
     Protanopia,

@@ -27,6 +27,12 @@ pub struct AppConfig {
     pub leitura_mouse: bool,
     pub largura_area_mouse: f32,
     pub altura_area_mouse: f32,
+
+    pub lupa_ativa: bool,
+    pub lupa_modo_mouse: bool,
+    pub lupa_fator_zoom: f32,
+    pub lupa_tamanho_janela: f32,
+    pub lupa_pixel_art: bool,
 }
 
 impl Default for AppConfig {
@@ -49,6 +55,12 @@ impl Default for AppConfig {
             leitura_mouse: false,
             largura_area_mouse: 350.0,
             altura_area_mouse: 80.0,
+
+            lupa_ativa: false,
+            lupa_modo_mouse: true,
+            lupa_fator_zoom: 3.0,
+            lupa_tamanho_janela: 300.0,
+            lupa_pixel_art: false,
         }
     }
 }

@@ -2,13 +2,16 @@ use egui_window_glfw_passthrough::{GlfwBackend, GlfwConfig};
 use std::sync::Arc;
 use global_hotkey::{hotkey::{HotKey, Modifiers, Code}, GlobalHotKeyManager, GlobalHotKeyEvent, HotKeyState};
 
-use windows_sys::Win32::UI::Magnification::{MagInitialize, MagUninitialize};
+use windows_sys::Win32::UI::Magnification::MagInitialize;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
 
 mod filtros;
 mod audio;
 mod leitor;
 use leitor::GerenciadorLeitor;
+
+mod lupa;
+use lupa::GerenciadorLupa;
 
 mod config;
 use config::AppConfig;
@@ -63,6 +66,17 @@ fn main() {
     backend.window.set_pos(v_x, v_y);
     backend.window.set_size(v_w, v_h - 1);
 
+    unsafe {
+        let hwnd = windows_sys::Win32::UI::WindowsAndMessaging::FindWindowA(
+            std::ptr::null(),
+            b"GhostOverlay\0".as_ptr(),
+        );
+        // O código 0x00000011 é o WDA_EXCLUDEFROMCAPTURE (Esconde da gravação, mas mantém visível pra você)
+        if hwnd != 0 {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(hwnd, 0x00000011);
+        }
+    }
+
     let hotkey_manager = GlobalHotKeyManager::new().unwrap();
     let hotkey = HotKey::new(Some(Modifiers::SHIFT), Code::F11);
     hotkey_manager.register(hotkey).expect("Falha ao registrar atalho global");
@@ -81,8 +95,6 @@ fn main() {
     
     // INICIALIZA O SISTEMA DE ÁUDIO REATIVO (MOCK)
     let gerenciador_audio = audio::GerenciadorAudio::new();
-    let mut limitador_ligado = false;
-    let mut limite_volume = 0.5;
 
     // INICIALIZA O GERENCIADOR DO LEITOR DE TELA (OCR)
     let mut gerenciador_leitor = GerenciadorLeitor::new(egui_ctx.clone());
@@ -96,6 +108,13 @@ fn main() {
     gerenciador_leitor.largura_area_mouse = config_app.largura_area_mouse;
     gerenciador_leitor.altura_area_mouse = config_app.altura_area_mouse;
     gerenciador_leitor.atualizar_config_tts();
+
+    let mut gerenciador_lupa = GerenciadorLupa::new(egui_ctx.clone());
+    gerenciador_lupa.ativo = config_app.lupa_ativa;
+    gerenciador_lupa.modo_mouse = config_app.lupa_modo_mouse;
+    gerenciador_lupa.fator_zoom = config_app.lupa_fator_zoom;
+    gerenciador_lupa.tamanho_janela = config_app.lupa_tamanho_janela;
+    gerenciador_lupa.pixel_art = config_app.lupa_pixel_art;
 
     filtros::atualizar_filtros(config_app.filtro_atual, config_app.brilho, config_app.contraste, config_app.saturacao, config_app.intensidade);
 
@@ -173,6 +192,11 @@ fn main() {
                             modo_menu_interativo = false; 
                         }
 
+                        ui.add_space(10.0);
+                        if gerenciador_lupa.exibir_ui(ui) {
+                            modo_menu_interativo = false; // Esconde o menu se for selecionar alvo
+                        }
+
                         // SEÇÃO DE PROTEÇÃO AUDITIVA
                         ui.add_space(10.0);
                         ui.heading("Proteção Auditiva");
@@ -214,10 +238,11 @@ fn main() {
             } else {
                 // Se o menu está oculto mas a seleção de área está rodando...
                 gerenciador_leitor.executar_selecao_invisivel(&egui_ctx);
+                gerenciador_lupa.executar_selecao_centro(&egui_ctx);
                 
                 // Assim que o usuário solta o clique do mouse, o `executar_selecao_invisivel` 
                 // altera internamente a flag `modo_selecao` para false. Capturamos isso para reabrir a UI!
-                if !gerenciador_leitor.modo_selecao {
+                if !gerenciador_leitor.modo_selecao && !gerenciador_lupa.selecionando_centro {
                     modo_menu_interativo = true;
                 }
             }
@@ -225,19 +250,26 @@ fn main() {
 
         // Renderiza o debug sempre, independente de o menu estar aberto ou não
         gerenciador_leitor.renderizar_overlay_debug(&egui_ctx);
+        gerenciador_lupa.atualizar_tick(&egui_ctx);
+        
+        // 👇 CORREÇÃO 1: Faltava renderizar a janela da lupa na tela!
+        gerenciador_lupa.renderizar_janela(&egui_ctx);
 
         let full_output = egui_ctx.end_frame();
         
-        // CONTROLE DE INPUT (PASSTHROUGH)
-        if gerenciador_leitor.modo_selecao {
+        // 👇 CORREÇÃO 2: Controle de Input (Passthrough) consertado para a lupa!
+        if gerenciador_leitor.modo_selecao || gerenciador_lupa.selecionando_centro {
+            // Se estamos definindo uma área (seja leitor ou lupa), captura o mouse!
             backend.set_passthrough(false);
         } else if modo_menu_interativo {
+            // Se o menu principal está aberto
             if egui_ctx.wants_pointer_input() || egui_ctx.is_using_pointer() {
                 backend.set_passthrough(false);
             } else {
                 backend.set_passthrough(true);
             }
         } else {
+            // Se estamos jogando e não definindo alvos, o mouse atravessa para o jogo
             backend.set_passthrough(true);
         }
 
@@ -268,6 +300,11 @@ fn main() {
     config_app.leitura_mouse = gerenciador_leitor.leitura_mouse;
     config_app.largura_area_mouse = gerenciador_leitor.largura_area_mouse;
     config_app.altura_area_mouse = gerenciador_leitor.altura_area_mouse;
+    config_app.lupa_ativa = gerenciador_lupa.ativo;
+    config_app.lupa_modo_mouse = gerenciador_lupa.modo_mouse;
+    config_app.lupa_fator_zoom = gerenciador_lupa.fator_zoom;
+    config_app.lupa_tamanho_janela = gerenciador_lupa.tamanho_janela;
+    config_app.lupa_pixel_art = gerenciador_lupa.pixel_art;
     
     // 2. Salva as configurações em %APPDATA%/GhostOverlay/config.json
     config_app.salvar();

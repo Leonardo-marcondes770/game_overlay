@@ -22,17 +22,16 @@ use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 const TEMPO_MOUSE_PARADO_MS: u64 = 500;
 const TOLERANCIA_MOVIMENTO_MOUSE: i32 = 5;
 
+// 👇 A mensagem agora carrega as configurações de tradução para a thread em background
 pub enum MensagemThread {
-    ProcessarRect(Rect),
+    ProcessarRect { rect: Rect, traduzir: bool, idioma_destino: String },
     ForcarFala(String),
     AtualizarTtsConfig { volume: f32, velocidade: f32, pitch: f32 },
 }
 
-// 👇 NOVA FUNÇÃO DE INTELIGÊNCIA: Mede a similaridade entre textos ignorando pontuação e ruídos (Levenshtein)
 fn sao_similares(a: &str, b: &str) -> bool {
     if a == b { return true; }
     
-    // Filtra apenas letras e números, ignorando espaços e cursores piscando
     let clean_a: String = a.chars().filter(|c| c.is_alphanumeric()).collect();
     let clean_b: String = b.chars().filter(|c| c.is_alphanumeric()).collect();
     
@@ -45,7 +44,6 @@ fn sao_similares(a: &str, b: &str) -> bool {
     
     if len_a == 0 || len_b == 0 { return false; }
     
-    // Se a diferença de tamanho for bizarra (> 25%), com certeza mudou o diálogo
     let diff = (len_a as i32 - len_b as i32).abs();
     if diff > (len_a.max(len_b) as i32 / 4).max(3) {
         return false;
@@ -66,7 +64,7 @@ fn sao_similares(a: &str, b: &str) -> bool {
     let dist = d[len_a][len_b] as f32;
     let similaridade = 1.0 - (dist / max_len);
     
-    similaridade > 0.85 // 85% de igualdade é considerado o mesmo texto
+    similaridade > 0.85 
 }
 
 pub struct GerenciadorLeitor {
@@ -88,11 +86,15 @@ pub struct GerenciadorLeitor {
     pub altura_area_mouse: f32,  
     posicao_anterior_mouse: (i32, i32),
     tempo_mouse_parado: Instant,
-    ja_leu_mouse_nesta_posicao: bool, // 👇 NOVO: Anti-spam pro CPU
+    ja_leu_mouse_nesta_posicao: bool,
 
     pub tts_volume: f32,
     pub tts_velocidade: f32,
     pub tts_pitch: f32,
+
+    // 👇 Novas variáveis na interface
+    pub traduzir: bool,
+    pub idioma_destino: String,
 
     ocr_ocupado: Arc<AtomicBool>,
     tx: Sender<MensagemThread>,
@@ -108,7 +110,7 @@ impl GerenciadorLeitor {
 
         thread::spawn(move || {
             let mut tts = Tts::default().ok();
-            let mut ultimo_texto_falado = String::new();
+            let mut ultimo_texto_capturado = String::new(); // Original na linguagem gringa
 
             while let Ok(msg) = rx.recv() {
                 match msg {
@@ -124,18 +126,29 @@ impl GerenciadorLeitor {
                             let _ = motor.speak(&texto, true);
                         }
                     }
-                    MensagemThread::ProcessarRect(rect) => {
+                    MensagemThread::ProcessarRect { rect, traduzir, idioma_destino } => {
                         if let Some(texto) = Self::capturar_e_ocr(rect, &ctx_thread) {
                             let texto_limpo = texto.trim().to_string();
                             
                             if !texto_limpo.is_empty() {
-                                // 👇 A MÁGICA ACONTECE AQUI: Só manda falar se o texto for relamente diferente
-                                if !sao_similares(&texto_limpo, &ultimo_texto_falado) {
-                                    if let Some(ref mut motor) = tts {
-                                        let _ = motor.speak(&texto_limpo, true);
+                                // 👇 Verifica similaridade no idioma ORIGINAL para não gastar API do Google à toa
+                                if !sao_similares(&texto_limpo, &ultimo_texto_capturado) {
+                                    ultimo_texto_capturado = texto_limpo.clone();
+                                    
+                                    let mut texto_final = texto_limpo;
+
+                                    // 👇 INTERCEPTA E TRADUZ PELA INTERNET (Se habilitado)
+                                    if traduzir {
+                                        if let Some(traduzido) = crate::tradutor::traduzir_texto(&texto_final, "auto", &idioma_destino) {
+                                            texto_final = traduzido;
+                                        }
                                     }
-                                    ultimo_texto_falado = texto_limpo.clone();
-                                    ctx_thread.data_mut(|d| d.insert_temp(Id::new("ocr_texto_key"), texto_limpo.clone()));
+
+                                    if let Some(ref mut motor) = tts {
+                                        let _ = motor.speak(&texto_final, true);
+                                    }
+                                    
+                                    ctx_thread.data_mut(|d| d.insert_temp(Id::new("ocr_texto_key"), texto_final));
                                 }
                             }
                         }
@@ -170,6 +183,10 @@ impl GerenciadorLeitor {
             tts_volume: 1.0,
             tts_velocidade: 1.0,
             tts_pitch: 1.0,
+
+            // 👇 Inicialização padrão
+            traduzir: false,
+            idioma_destino: "pt".to_string(),
 
             ocr_ocupado,
             tx,
@@ -207,10 +224,9 @@ impl GerenciadorLeitor {
             if mov_x > TOLERANCIA_MOVIMENTO_MOUSE || mov_y > TOLERANCIA_MOVIMENTO_MOUSE {
                 self.posicao_anterior_mouse = (pt.x, pt.y);
                 self.tempo_mouse_parado = Instant::now();
-                self.ja_leu_mouse_nesta_posicao = false; // Mouse moveu, reseta flag
+                self.ja_leu_mouse_nesta_posicao = false; 
             } else if !self.ja_leu_mouse_nesta_posicao && self.tempo_mouse_parado.elapsed() >= Duration::from_millis(TEMPO_MOUSE_PARADO_MS) && ocr_livre {
                 let dpi = ctx.pixels_per_point();
-
                 let offset_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
                 let offset_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
 
@@ -226,7 +242,7 @@ impl GerenciadorLeitor {
                 );
                 
                 self.disparar_ocr(rect_mouse);
-                self.ja_leu_mouse_nesta_posicao = true; // Evita loop no mouse parado!
+                self.ja_leu_mouse_nesta_posicao = true; 
             }
         }
 
@@ -239,7 +255,11 @@ impl GerenciadorLeitor {
 
     fn disparar_ocr(&mut self, rect: Rect) {
         self.ocr_ocupado.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(MensagemThread::ProcessarRect(rect));
+        let _ = self.tx.send(MensagemThread::ProcessarRect {
+            rect,
+            traduzir: self.traduzir,
+            idioma_destino: self.idioma_destino.clone(),
+        });
     }
 
     pub fn atualizar_config_tts(&self) {
@@ -295,6 +315,29 @@ impl GerenciadorLeitor {
 
             ui.add_space(8.0);
 
+            // 👇 NOVO: Painel de Tradução integrado à UI
+            ui.group(|ui| {
+                ui.label("🌍 Tradução em Tempo Real");
+                ui.checkbox(&mut self.traduzir, "Traduzir texto antes de falar");
+                
+                if self.traduzir {
+                    egui::ComboBox::from_label("Idioma da Voz (Destino)")
+                        .selected_text(match self.idioma_destino.as_str() {
+                            "pt" => "Português",
+                            "en" => "Inglês",
+                            "es" => "Espanhol",
+                            _ => "Português",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.idioma_destino, "pt".to_string(), "Português");
+                            ui.selectable_value(&mut self.idioma_destino, "en".to_string(), "Inglês");
+                            ui.selectable_value(&mut self.idioma_destino, "es".to_string(), "Espanhol");
+                        });
+                }
+            });
+
+            ui.add_space(8.0);
+
             ui.group(|ui| {
                 ui.label("🔊 Configurações de Voz");
                 let mut mudou_voz = false;
@@ -319,7 +362,7 @@ impl GerenciadorLeitor {
             ui.add_space(8.0);
 
             ui.group(|ui| {
-                ui.label(format!("Último texto lido:\n{}", self.texto_extraido));
+                ui.label(format!("Último texto processado:\n{}", self.texto_extraido));
                 ui.add_space(6.0);
                 if ui.button("🗣️ Ler Texto Atual Novamente").clicked() {
                     let texto = self.texto_extraido.clone();
@@ -434,7 +477,6 @@ impl GerenciadorLeitor {
         let offset_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
         let offset_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
 
-        // 1. Converte a coordenada interna do Egui de volta para a coordenada Global do Windows
         let global_x = (rect.min.x * dpi) as i32 + offset_x;
         let global_y = (rect.min.y * dpi) as i32 + offset_y;
         let w = (rect.width() * dpi) as u32;
@@ -443,7 +485,6 @@ impl GerenciadorLeitor {
         let monitors = Monitor::all().ok()?;
         let mut monitor_alvo = None;
         
-        // 2. Verifica em qual monitor esse ponto global caiu
         for m in monitors {
             if global_x >= m.x() && global_x < m.x() + m.width() as i32 &&
                global_y >= m.y() && global_y < m.y() + m.height() as i32 {
@@ -454,13 +495,11 @@ impl GerenciadorLeitor {
         
         let monitor = monitor_alvo.unwrap_or_else(|| Monitor::all().unwrap().into_iter().next().unwrap());
 
-        // 3. Converte a coordenada Global para uma coordenada Local do Monitor específico
         let local_x = (global_x - monitor.x()).max(0) as u32;
         let local_y = (global_y - monitor.y()).max(0) as u32;
 
         let img = DynamicImage::ImageRgba8(monitor.capture_image().ok()?);
 
-        // Previne crash caso a área selecionada passe da borda desse monitor
         let clip_w = w.min(img.width().saturating_sub(local_x));
         let clip_h = h.min(img.height().saturating_sub(local_y));
         if clip_w == 0 || clip_h == 0 { return None; }
